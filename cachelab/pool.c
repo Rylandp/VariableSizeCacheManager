@@ -44,36 +44,46 @@ int pool_init(memory_pool_t *pool, size_t size, alloc_policy_t policy) {
 /* ---------- Student work: search the embedded block list ---------- */
 
 static block_header_t *first_fit(memory_pool_t *pool, size_t requested) {
-    /* TODO: Walk from pool->blocks. Return the first FREE block with payload
-     * capacity >= requested, or NULL. The list also contains allocated blocks. */
-    (void)pool;
-    (void)requested;
-    UNFINISHED("first_fit");
+    block_header_t *cur = pool->blocks;
+    while (cur != NULL) {
+        if(cur->free && cur->size >= requested) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    return NULL;
 }
 
 static block_header_t *best_fit(memory_pool_t *pool, size_t requested) {
-    /* TODO: Inspect the entire address-ordered list; choose the smallest
-     * sufficient FREE block. On equal capacities keep the earlier address.
-     * Return NULL if none fits. */
-    (void)pool;
-    (void)requested;
-    UNFINISHED("best_fit");
+    block_header_t *cur = pool->blocks;
+    block_header_t *best = NULL;
+    while(cur != NULL) {
+        if(cur->free && cur->size >= requested && (best == NULL || cur->size < best->size)){
+            best = cur;
+        }
+        cur = cur->next;
+    }
+    return best;
 }
 
 /* ---------- Student work: carve a second header inside the pool ---------- */
 
 static void split_if_possible(block_header_t *block, size_t requested) {
-    /* TODO: The new header starts at payload_from_header(block) +
-     * round_up(requested, HEADER_ALIGNMENT). Split only when the space left
-     * BEFORE the new header is at least MIN_BLOCK_SIZE (a header plus a
-     * payload byte). Check the rounded size before subtracting it.
-     * Link the new FREE block into the address-ordered list and set both
-     * payload capacities. If no valid split fits, leave block->size alone. */
-    (void)block;
-    (void)requested;
-    (void)round_up;
-    (void)payload_from_header;
-    UNFINISHED("split_if_possible");
+    size_t aligned = round_up(requested, HEADER_ALIGNMENT);
+    if(block->size < aligned){
+        return;
+    }
+    size_t remainder = block->size - aligned;
+    if(remainder < MIN_BLOCK_SIZE){
+        return;
+    }  
+    block_header_t *newBlock = (block_header_t *)((unsigned char *)payload_from_header(block) + aligned);
+    newBlock->size = remainder-HEADER_SIZE;
+    newBlock->free = 1;
+    newBlock->next = block->next;
+
+    block->size = aligned;
+    block->next = newBlock;
 }
 
 /* ---------- Student work: select, split and occupy ---------- */
@@ -84,12 +94,18 @@ void *pool_try_alloc(memory_pool_t *pool, size_t requested) {
      * split if possible, mark the selected block allocated and return its
      * payload. Do not evict here: the cache handler owns that retry loop.
      * The caller already holds the provided cache/output locks. */
-    (void)pool;
-    (void)requested;
-    (void)first_fit;
-    (void)best_fit;
-    (void)split_if_possible;
-    UNFINISHED("pool_try_alloc");
+    block_header_t *ret = NULL;
+    if(pool->policy == ALLOC_FIRST_FIT) {
+        ret = first_fit(pool, requested);
+    } else {
+        ret = best_fit(pool, requested);
+    }
+    if(ret == NULL) {
+        return NULL;
+    }
+    split_if_possible(ret, requested);
+    ret->free = 0;
+    return payload_from_header(ret);
 }
 
 /* ---------- Student work: free and coalesce ---------- */
@@ -102,11 +118,42 @@ void pool_free(memory_pool_t *pool, void *payload, event_context_t *ev) {
      * next links. Emit one COALESCE per actual merge via output_event(ev,...)
      * with req/client IDs, surviving payload offset and new payload size.
      * No mutex operations belong here; the worker already holds the locks. */
-    (void)pool;
-    (void)payload;
-    (void)ev;
-    (void)header_from_payload;
-    UNFINISHED("pool_free");
+    if (payload == NULL) {
+        return;
+    }
+    block_header_t *block = header_from_payload(payload);
+    block->free = 1;
+
+    if(block->next != NULL && block->next->free) {    
+        block_header_t *successor = block->next;
+        block->size += HEADER_SIZE + successor->size;
+        block->next = successor->next;
+        output_event(ev, 
+                    "COALESCE req=%zu client=%d addr=%zu size=%zu",
+                    ev->req_seq,
+                    ev->client_id,
+                    pool_offset(pool, payload_from_header(block)),
+                    block->size);
+    }
+
+    block_header_t *prev = NULL;
+    block_header_t *cur = pool->blocks;
+
+    while(cur != NULL && cur != block) {
+        prev = cur;
+        cur = cur->next;
+    }
+
+    if (prev != NULL && prev->free) {
+        prev->size += HEADER_SIZE + block->size;
+        prev->next = block->next;
+        output_event(ev, 
+                    "COALESCE req=%zu client=%d addr=%zu size=%zu",
+                    ev->req_seq,
+                    ev->client_id,
+                    pool_offset(pool, payload_from_header(prev)),
+                    prev->size);
+    }
 }
 
 /* ---------- Provided inspection and teardown ---------- */
