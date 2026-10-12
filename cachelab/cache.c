@@ -25,8 +25,7 @@ void output_event(event_context_t *ev, const char *fmt, ...) {
 cache_entry_t *evict_fifo_select(cache_t *cache) {
     /* TODO: Return the oldest active entry, or NULL when empty. GET does
      * not change the insertion order. */
-    (void)cache;
-    UNFINISHED("evict_fifo_select");
+    return cache->policy_head;
 }
 
 cache_entry_t *evict_clock_select(cache_t *cache) {
@@ -37,8 +36,16 @@ cache_entry_t *evict_clock_select(cache_t *cache) {
      * Return NULL for an empty cache. Provided policy_append initializes
      * the hand; policy_remove repairs it if removing the pointed-to entry.
      * Do not call policy_remove while selecting: evict_one does it later. */
-    (void)cache;
-    UNFINISHED("evict_clock_select");
+    cache_entry_t *cur = cache->clock_hand;
+    if(cur == NULL){
+        return NULL;
+    }
+    while(cur->reference_bit) {
+        cur->reference_bit = 0;
+        cur = policy_successor(cache, cur);
+    }
+    cache->clock_hand = policy_successor(cache, cur);
+    return cur;
 }
 
 /* ---------- Provided transaction: evict one selected active entry ---------- */
@@ -63,10 +70,18 @@ void handle_get(cache_t *cache, request_t *req, event_context_t *ev) {
      * emits HIT; a miss increments misses and emits MISS. GET does not
      * allocate, reorder the policy list or change the clock hand.
      * The provided worker holds cache_lock and output_lock already. */
-    (void)cache;
-    (void)req;
-    (void)ev;
-    UNFINISHED("handle_get");
+    cache_entry_t *entry = index_find(cache, req->key);
+
+    if(entry == NULL){
+        cache->misses++;
+        output_event(ev, "MISS req=%zu client=%d key=%s",
+            ev->req_seq, ev->client_id, req->key);
+    } else {
+        entry->reference_bit = 1;
+        cache->hits++;
+        output_event(ev, "HIT req=%zu client=%d key=%s",
+            ev->req_seq, ev->client_id, req->key);
+    }
 }
 
 /* ---------- Student work: PUT, update and eviction retry ---------- */
@@ -84,9 +99,51 @@ void handle_put(cache_t *cache, request_t *req, event_context_t *ev) {
      * index, append to the policy list, add requested occupancy, emit ALLOC.
      * No malloc of entries and no mutex operations: the worker holds both
      * cache_lock and output_lock throughout this request. */
-    (void)cache;
-    (void)req;
-    (void)ev;
-    (void)evict_one;
-    UNFINISHED("handle_put");
+
+    output_event(ev, "PUT req=%zu client=%d key=%s size=%zu",
+        ev->req_seq, ev->client_id, req->key, req->size);
+
+    if(req->size > cache->pool.size - HEADER_SIZE){
+        cache->rejects++;
+        output_event(ev, "REJECT req=%zu client=%d key=%s size=%zu",
+            ev->req_seq, ev->client_id, req->key, req->size);
+        return;
+    }
+    cache_entry_t *oldEntry = index_find(cache, req->key);
+    
+    if(oldEntry != NULL){
+        output_event(ev, "UPDATE req=%zu client=%d key=%s old_size=%zu new_size=%zu",
+            ev->req_seq, ev->client_id, req->key, oldEntry->requested_size, req->size);
+        index_remove(cache, oldEntry);
+        policy_remove(cache, oldEntry);
+        cache->occupancy -= oldEntry->requested_size;
+        pool_free(&cache->pool, oldEntry->payload, ev);
+    }
+
+    void *payload;
+    while((payload = pool_try_alloc(&cache->pool, req->size)) == NULL) {        
+        cache_entry_t *victim = NULL;
+        if(cache->eviction_policy == EVICT_FIFO){
+            victim = evict_fifo_select(cache);
+        }
+        if(cache->eviction_policy == EVICT_CLOCK){
+            victim = evict_clock_select(cache);
+        }
+        if(victim == NULL){
+            fprintf(stderr, "allocation failed-- no cache entry to evict");
+            exit(EXIT_FAILURE);
+        }
+        evict_one(cache, victim, ev);
+    }
+    cache_entry_t *entry = &req->entry_storage;
+    strcpy(entry->key, req->key);
+    entry->requested_size = req->size;
+    entry->payload = payload;
+    entry->reference_bit = 1;
+
+    index_insert(cache, entry);
+    policy_append(cache, entry);
+    cache->occupancy+= req->size;
+    output_event(ev, "ALLOC req=%zu client=%d key=%s size=%zu addr=%zu",
+           ev->req_seq, ev->client_id, entry->key, entry->requested_size, pool_offset(&cache->pool, payload));
 }
